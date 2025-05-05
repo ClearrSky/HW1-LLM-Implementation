@@ -221,10 +221,10 @@ torch.set_float32_matmul_precision('medium')
 num_return_seqeunces= 5
 max_length = 30
 
-# model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
-model.eval()        # 将模型设置为推理/评估状态
+# model.eval()        # 将模型设置为推理/评估状态
 model.to(device)
+model = torch.compile(model)
 
 train_loader = DataLoaderLite(B=4, T=32)
 # optimization
