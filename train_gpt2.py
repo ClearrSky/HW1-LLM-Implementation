@@ -227,6 +227,8 @@ class DataLoaderLite:
  
         # state
         # state, init at shard zero
+        self.reset()
+    def reset(self):
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
@@ -284,8 +286,6 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 torch.set_float32_matmul_precision('medium')
 
-num_return_seqeunces= 5
-max_length = 30
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
@@ -310,9 +310,9 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
 
-
+enc = tiktoken.get_encoding("gpt2")
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+B = 32 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size) # number of micro steps per macro step
@@ -321,12 +321,72 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 # optimization
 
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 for step in range(max_steps):
     t0 = time.time()
+    
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x,y = val_loader.next_batch()
+                x = x.to(device)
+                y = y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x,y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"val loss: {val_loss_accum.item():.4f}")
+    
+    # once in a while generate from the model (except step 0, which is noise)
+    # disabled because torch.compile throws a scary error i can't solve rn
+    # if you disable torch.compile, this code works fine
+    if step > 0 and step % 100 == 0 and False:
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                logits, loss = model(xgen) # (B, T, vocab_size)
+                # take the logits at the last position
+                logits = logits[:, -1, :] # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 50 (huggingface pipeline default)
+                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+            
+    model.train()
+    optimizer.zero_grad()
+    loss_accum = 0.0       
     for micro_step in range(grad_accum_steps):
         x,y = train_loader.next_batch()
         x = x.to(device)
@@ -357,39 +417,3 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
-import sys;sys.exit(0)
-
-# prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens,dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_seqeunces,1) # repeat(size)，按size在对应维度重复相应次数
-x = tokens.to(device)
-
-
-    
-# start generate
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        # logits: (B, T, vocab_size)
-        logits,_ = model(x)
-        # the last position means the next token
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        # topk_probs,topk_indices:(5,50),indices在[0,50257)之间
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # 从分布中采样元素
-        ix = torch.multinomial(topk_probs,1)
-        # gather函数从输入张量中根据索引取值
-        xcol = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x,xcol),dim=1)
-
-# print the generated text
-for i in range(num_return_seqeunces):
-    tokens = x[i,:max_length].tolist()
-    text = enc.decode(tokens)
-    print(">",text)
-    
