@@ -235,7 +235,8 @@ for i in range(50):
     x = x.to(device)
     y = y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x,y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16): # 只有部分计算被autocast为bf16
+        logits, loss = model(x,y)       
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize()
