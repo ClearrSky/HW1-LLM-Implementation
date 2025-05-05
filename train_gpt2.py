@@ -382,6 +382,25 @@ for step in range(max_steps):
             print(f"val loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                # checkpoint 可以存储更多信息
+                checkpoint = {
+                    'model':raw_model.state_dict(),
+                    'config':raw_model.config,
+                    'step':step,
+                    'val_loss': val_loss_accum.item(),
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"saved checkpoint to {checkpoint_path}")
+        model.train()
+    # training
+    train_loader.reset()
+    for _ in range(grad_accum_steps):
+        x,y = train_loader.next_batch()
+        x = x.to(device)
+        y = y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
  
     # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):
