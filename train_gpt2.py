@@ -202,6 +202,7 @@ class DataLoaderLite:
         return x, y
     
 #---------------------------------------
+import time
 
 # Auto detect devices
 device = "cpu"
@@ -215,6 +216,8 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+torch.set_float32_matmul_precision('medium')
+
 num_return_seqeunces= 5
 max_length = 30
 
@@ -227,6 +230,7 @@ train_loader = DataLoaderLite(B=4, T=32)
 # optimization
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x,y = train_loader.next_batch()
     x = x.to(device)
     y = y.to(device)
@@ -234,7 +238,11 @@ for i in range(50):
     logits, loss = model(x,y)
     loss.backward()
     optimizer.step()
-    print("step: %d, loss: %f" % (i, loss.item()))
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1-t0)*1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item():.4f}, dt:({dt:.2f} ms), tokens/sec: {tokens_per_sec:.2f}")
 
 import sys;sys.exit(0)
 
